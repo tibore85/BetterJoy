@@ -58,6 +58,7 @@ namespace BetterJoyForCemu {
             IMU,
             RUMBLE,
             SHAKE,
+            LATENCY,
         };
         public DebugType debug_type = (DebugType)int.Parse(ConfigurationManager.AppSettings["DebugType"]);
         //public DebugType debug_type = DebugType.NONE; //Keep this for manual debugging during development.
@@ -550,56 +551,135 @@ namespace BetterJoyForCemu {
             state = state_.NOT_ATTACHED;
         }
 
+        private readonly LatencyStats latency = new LatencyStats();
+        private long pendingVpadTimestamp; // arrival of the oldest report not yet reflected on a virtual controller
+
+        private bool LatencyEnabled {
+            get { return debug_type == DebugType.LATENCY || debug_type == DebugType.ALL; }
+        }
+
+        private static void MarkVpadUpdated(Joycon source, long now) {
+            long pending = Interlocked.Exchange(ref source.pendingVpadTimestamp, 0);
+            if (pending != 0)
+                source.latency.AddReportToVpad(now - pending);
+        }
+
+        private void PrintLatencySummary() {
+            if (!LatencyEnabled || !latency.SummaryDue) return;
+            string vpad = (out_xbox != null || out_ds4 != null) ? "own" : (other != null && other != this ? "via pad " + other.PadId : "none");
+            DebugPrint(string.Format("Latency pad {0} ({1}, {2}, vpad {3}): {4}", PadId, isPro ? "pro" : (isLeft ? "left" : "right"), isUSB ? "USB" : "BT", vpad, latency.TakeSummary()), DebugType.LATENCY);
+        }
+
+        // Guards input state and virtual controller updates, which the joined partner's poll thread also touches.
+        private readonly object stateLock = new object();
+
+        // Called from the joined partner's poll thread with its freshly processed input.
+        private void PushMergedInput() {
+            // Gyro-to-joystick offsets are only applied during this Joy-Con's own report processing.
+            if (extraGyroFeature.StartsWith("joy")) return;
+
+            lock (stateLock) {
+                Joycon partner = other;
+                OutputControllerXbox360 xbox = out_xbox;
+                OutputControllerDualShock4 ds4 = out_ds4;
+                if (partner == null || partner == this || (xbox == null && ds4 == null) || state != state_.IMU_DATA_OK)
+                    return;
+
+                bool[] mergedButtons = (bool[])buttons.Clone();
+                MergeOtherButtons(mergedButtons);
+                float[] mergedStick = isLeft ? stick : otherStick;
+                float[] mergedStick2 = isLeft ? otherStick : stick2;
+
+                try {
+                    if (ds4 != null)
+                        ds4.UpdateInput(MapToDualShock4Input(this, mergedButtons, mergedStick, mergedStick2));
+                    if (xbox != null)
+                        xbox.UpdateInput(MapToXbox360Input(this, mergedButtons, mergedStick, mergedStick2));
+                } catch (Exception) {
+                    // ignore, as in ReceiveRaw
+                }
+
+                if (LatencyEnabled)
+                    MarkVpadUpdated(partner, Stopwatch.GetTimestamp());
+            }
+        }
+
         private byte ts_en;
         private int ReceiveRaw() {
             if (handle == IntPtr.Zero) return -2;
             byte[] raw_buf = new byte[report_len];
+            long readStart = Stopwatch.GetTimestamp();
             int ret = HIDapi.hid_read_timeout(handle, raw_buf, new UIntPtr(report_len), 5);
 
             if (ret > 0) {
-                // Process packets as soon as they come
-                for (int n = 0; n < 3; n++) {
-                    ExtractIMUValues(raw_buf, n);
+                long readEnd = Stopwatch.GetTimestamp();
+                if (LatencyEnabled) {
+                    latency.AddReport(readStart, readEnd);
+                    Interlocked.CompareExchange(ref pendingVpadTimestamp, readEnd, 0);
+                }
 
-                    byte lag = (byte)Math.Max(0, raw_buf[1] - ts_en - 3);
-                    if (n == 0) {
-                        Timestamp += (ulong)lag * 5000; // add lag once
-                        ProcessButtonsAndStick(raw_buf);
+                lock (stateLock) {
+                    // Process packets as soon as they come
+                    for (int n = 0; n < 3; n++) {
+                        ExtractIMUValues(raw_buf, n);
 
-                        // process buttons here to have them affect DS4
-                        DoThingsWithButtons();
+                        byte lag = (byte)Math.Max(0, raw_buf[1] - ts_en - 3);
+                        if (n == 0) {
+                            Timestamp += (ulong)lag * 5000; // add lag once
+                            ProcessButtonsAndStick(raw_buf);
 
-                        int newbat = battery;
-                        battery = (raw_buf[2] >> 4) / 2;
-                        if (newbat != battery)
-                            BatteryChanged();
+                            // process buttons here to have them affect DS4
+                            DoThingsWithButtons();
+
+                            int newbat = battery;
+                            battery = (raw_buf[2] >> 4) / 2;
+                            if (newbat != battery)
+                                BatteryChanged();
+                        }
+                        Timestamp += 5000; // 5ms difference
+
+                        packetCounter++;
+                        if (Program.server != null)
+                            Program.server.NewReportIncoming(this);
+
+                        if (out_ds4 != null) {
+                            try {
+                                out_ds4.UpdateInput(MapToDualShock4Input(this));
+                            } catch (Exception e) {
+                                // ignore /shrug
+                            }
+                        }
                     }
-                    Timestamp += 5000; // 5ms difference
 
-                    packetCounter++;
-                    if (Program.server != null)
-                        Program.server.NewReportIncoming(this);
-
-                    if (out_ds4 != null) {
+                    // no reason to send XInput reports so often
+                    if (out_xbox != null) {
                         try {
-                            out_ds4.UpdateInput(MapToDualShock4Input(this));
+                            out_xbox.UpdateInput(MapToXbox360Input(this));
                         } catch (Exception e) {
                             // ignore /shrug
                         }
                     }
-                }
 
-                // no reason to send XInput reports so often
-                if (out_xbox != null) {
-                    try {
-                        out_xbox.UpdateInput(MapToXbox360Input(this));
-                    } catch (Exception e) {
-                        // ignore /shrug
+                    if (LatencyEnabled) {
+                        long now = Stopwatch.GetTimestamp();
+                        if (out_xbox != null || out_ds4 != null) {
+                            MarkVpadUpdated(this, now);
+                            Joycon partner = other;
+                            if (partner != null && partner != this)
+                                MarkVpadUpdated(partner, now);
+                        }
+                        latency.AddProcessing(now - readEnd);
                     }
                 }
 
+                // When joined, only one Joy-Con owns the virtual controller; push this one's input now
+                // instead of waiting for the owner's next report (up to one report period later).
+                Joycon owner = other;
+                if (out_xbox == null && out_ds4 == null && owner != null && owner != this)
+                    owner.PushMergedInput();
 
                 if (ts_en == raw_buf[1] && !(isSnes || is64)) {
+                    if (LatencyEnabled) latency.AddDuplicateTimestamp();
                     form.AppendTextBox("Duplicate timestamp enqueued.\r\n");
                     DebugPrint(string.Format("Duplicate timestamp enqueued. TS: {0:X2}", ts_en), DebugType.THREADING);
                 }
@@ -874,6 +954,7 @@ namespace BetterJoyForCemu {
                     SendRumble(rumble_obj.GetData());
                 }
                 int a = ReceiveRaw();
+                PrintLatencySummary();
 
                 if (a > 0 && state > state_.DROPPED) {
                     state = state_.IMU_DATA_OK;
@@ -975,25 +1056,7 @@ namespace BetterJoyForCemu {
                     buttons[(int)Button.SHOULDER2_2] = (report_buf[3 + (!isLeft ? 2 : 0)] & 0x80) != 0;
                 }
 
-                if (other != null && other != this) {
-                    buttons[(int)(Button.B)] = other.buttons[(int)Button.DPAD_DOWN];
-                    buttons[(int)(Button.A)] = other.buttons[(int)Button.DPAD_RIGHT];
-                    buttons[(int)(Button.X)] = other.buttons[(int)Button.DPAD_UP];
-                    buttons[(int)(Button.Y)] = other.buttons[(int)Button.DPAD_LEFT];
-
-                    buttons[(int)Button.STICK2] = other.buttons[(int)Button.STICK];
-                    buttons[(int)Button.SHOULDER2_1] = other.buttons[(int)Button.SHOULDER_1];
-                    buttons[(int)Button.SHOULDER2_2] = other.buttons[(int)Button.SHOULDER_2];
-                }
-
-                if (isLeft && other != null && other != this) {
-                    buttons[(int)Button.HOME] = other.buttons[(int)Button.HOME];
-                    buttons[(int)Button.PLUS] = other.buttons[(int)Button.PLUS];
-                }
-
-                if (!isLeft && other != null && other != this) {
-                    buttons[(int)Button.MINUS] = other.buttons[(int)Button.MINUS];
-                }
+                MergeOtherButtons(buttons);
 
                 long timestamp = Stopwatch.GetTimestamp();
 
@@ -1015,6 +1078,28 @@ namespace BetterJoyForCemu {
             }
 
             return 0;
+        }
+
+        private void MergeOtherButtons(bool[] target) {
+            Joycon partner = other;
+            if (partner == null || partner == this) return;
+            bool[] partnerButtons = partner.buttons;
+
+            target[(int)(Button.B)] = partnerButtons[(int)Button.DPAD_DOWN];
+            target[(int)(Button.A)] = partnerButtons[(int)Button.DPAD_RIGHT];
+            target[(int)(Button.X)] = partnerButtons[(int)Button.DPAD_UP];
+            target[(int)(Button.Y)] = partnerButtons[(int)Button.DPAD_LEFT];
+
+            target[(int)Button.STICK2] = partnerButtons[(int)Button.STICK];
+            target[(int)Button.SHOULDER2_1] = partnerButtons[(int)Button.SHOULDER_1];
+            target[(int)Button.SHOULDER2_2] = partnerButtons[(int)Button.SHOULDER_2];
+
+            if (isLeft) {
+                target[(int)Button.HOME] = partnerButtons[(int)Button.HOME];
+                target[(int)Button.PLUS] = partnerButtons[(int)Button.PLUS];
+            } else {
+                target[(int)Button.MINUS] = partnerButtons[(int)Button.MINUS];
+            }
         }
 
         // Get Gyro/Accel data
@@ -1164,7 +1249,9 @@ namespace BetterJoyForCemu {
             else ++global_count;
             Array.Copy(buf, 0, buf_, 2, 8);
             PrintArray(buf_, DebugType.RUMBLE, format: "Rumble data sent: {0:S}");
+            long writeStart = Stopwatch.GetTimestamp();
             HIDapi.hid_write(handle, buf_, new UIntPtr(report_len));
+            if (LatencyEnabled) latency.AddRumbleWrite(Stopwatch.GetTimestamp() - writeStart);
         }
 
         private byte[] Subcommand(byte sc, byte[] buf, uint len, bool print = true) {
@@ -1422,6 +1509,10 @@ namespace BetterJoyForCemu {
         }
 
         private static OutputControllerXbox360InputState MapToXbox360Input(Joycon input) {
+            return MapToXbox360Input(input, input.buttons, input.stick, input.stick2);
+        }
+
+        private static OutputControllerXbox360InputState MapToXbox360Input(Joycon input, bool[] buttons, float[] stick, float[] stick2) {
             var output = new OutputControllerXbox360InputState();
 
 
@@ -1435,9 +1526,6 @@ namespace BetterJoyForCemu {
             var other = input.other;
             var GyroAnalogSliders = input.GyroAnalogSliders;
 
-            var buttons = input.buttons;
-            var stick = input.stick;
-            var stick2 = input.stick2;
             var sliderVal = input.sliderVal;
 
             if (is64)
@@ -1558,6 +1646,10 @@ namespace BetterJoyForCemu {
         }
 
         public static OutputControllerDualShock4InputState MapToDualShock4Input(Joycon input) {
+            return MapToDualShock4Input(input, input.buttons, input.stick, input.stick2);
+        }
+
+        private static OutputControllerDualShock4InputState MapToDualShock4Input(Joycon input, bool[] buttons, float[] stick, float[] stick2) {
             var output = new OutputControllerDualShock4InputState();
 
             var swapAB = input.swapAB;
@@ -1570,9 +1662,6 @@ namespace BetterJoyForCemu {
             var other = input.other;
             var GyroAnalogSliders = input.GyroAnalogSliders;
 
-            var buttons = input.buttons;
-            var stick = input.stick;
-            var stick2 = input.stick2;
             var sliderVal = input.sliderVal;
 
             if (is64)
